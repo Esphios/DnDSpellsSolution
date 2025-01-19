@@ -1,0 +1,56 @@
+# Visual Studio
+.vs/
+.vscode/
+*.suo
+*.user
+*.userosscache
+*.sln.docstates
+
+# Build Results
+bin/
+obj/
+out/
+
+# .NET Core
+project.lock.json
+project.fragment.lock.json
+artifacts/
+
+# NPM Packages (for Vue.js)
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Logs
+*.log
+logs/
+*.tlog
+
+# Environment Variables
+.env
+.env.*
+
+# EF Core Migrations
+Migrations/
+
+# Docker
+docker-compose.override.yml
+docker-compose.override.yaml
+*.pid
+*.seed
+
+# JetBrains Rider
+.idea/
+
+# Generated files
+*.generated.cs
+*.Designer.cs
+
+# Database
+sql_data/
+
+# OS Files
+.DS_Store
+Thumbs.db
+desktop.ini
