@@ -16,8 +16,8 @@ public class SpellRequest
     [MaxLength(100)]
     public string Name { get; set; } = "Not Available";
 
-    public List<string> Desc { get; set; } = new();
-    public List<string> HigherLevel { get; set; } = new();
+    public List<string> Desc { get; set; } = [];
+    public List<string> HigherLevel { get; set; } = [];
 
     [MaxLength(50)]
     public string Range { get; set; } = "Not Available";
@@ -25,7 +25,7 @@ public class SpellRequest
     /// <summary>
     /// Typically a list of string components like ["V","S","M"]
     /// </summary>
-    public List<string> Components { get; set; } = new();
+    public List<string> Components { get; set; } = [];
 
     [MaxLength(600)]
     public string Material { get; set; } = "Not Available";
@@ -55,12 +55,12 @@ public class SpellRequest
     /// A list of string IDs representing classes 
     /// (e.g. ["wizard","sorcerer"])
     /// </summary>
-    public List<string> ClassIds { get; set; } = new();
+    public List<string> ClassIds { get; set; } = [];
 
     /// <summary>
     /// A list of string IDs representing subclasses
     /// </summary>
-    public List<string> SubclassIds { get; set; } = new();
+    public List<string> SubclassIds { get; set; } = [];
 
     [MaxLength(200)]
     public string Url { get; set; } = "Not Available";

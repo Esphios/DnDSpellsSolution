@@ -3,6 +3,7 @@ using ApplicationCore.Interfaces.Repositories;
 using ApplicationCore.Dtos;
 using Infrastructure.Data;
 using Microsoft.EntityFrameworkCore;
+using System.Linq.Expressions;
 
 namespace Infrastructure.Repositories
 {
@@ -10,33 +11,84 @@ namespace Infrastructure.Repositories
     {
         private readonly ApplicationDbContext _dbContext = dbContext;
 
-        public async Task<IEnumerable<Spell>> GetAllSpellsAsync()
+        public async Task<(IEnumerable<Spell> Spells, int TotalItems, int CurrentPage)> GetAllSpellsAsync(
+            int page, int pageSize, string? filter, string? sortBy, string? sortDirection, CancellationToken cancellationToken)
         {
-            return await _dbContext.Spells
+            var query = _dbContext.Spells
                 .Include(s => s.Classes)
-                .Include(s => s.Subclasses)
-                .Include(s => s.School) 
-                .AsNoTracking()
-                .ToListAsync();
+                .Include(s => s.School)
+                .AsNoTracking();
+
+            // Apply filter if provided
+            if (!string.IsNullOrEmpty(filter))
+            {
+                query = query.Where(s => s.Name.Contains(filter));
+            }
+
+            // Apply sorting
+            query = ApplySorting(query, sortBy, sortDirection);
+
+            // Get total count for pagination
+            int totalItems = await query.CountAsync(cancellationToken);
+
+            // Apply pagination
+            var spells = await query.Skip((page - 1) * pageSize).Take(pageSize).ToListAsync(cancellationToken);
+
+            return (spells, totalItems, page);
         }
 
-        public async Task<Spell?> GetSpellByIdAsync(string id)
+        private static IQueryable<Spell> ApplySorting(IQueryable<Spell> query, string? sortBy, string? sortDirection)
+        {
+            // Default sort
+            if (string.IsNullOrEmpty(sortBy))
+            {
+                sortBy = "name";
+            }
+
+            bool isAscending = string.IsNullOrEmpty(sortDirection) || sortDirection.Equals("asc", StringComparison.CurrentCultureIgnoreCase);
+
+            // Apply sorting based on column
+            query = sortBy.ToLower() switch
+            {
+                "name" => isAscending
+                                        ? query.OrderBy(s => s.Name)
+                                        : query.OrderByDescending(s => s.Name),
+                "level" => isAscending
+                                        ? query.OrderBy(s => s.Level)
+                                        : query.OrderByDescending(s => s.Level),
+                "class" => isAscending
+                                        ? query.OrderBy(s => 
+                                            s.Classes.OrderBy(c => c.Name)
+                                                     .Select(c => c.Name)
+                                                     .FirstOrDefault() ?? string.Empty)
+                                        : query.OrderByDescending(s => 
+                                            s.Classes.OrderBy(c => c.Name)
+                                                     .Select(c => c.Name)
+                                                     .FirstOrDefault() ?? string.Empty),
+                _ => isAscending
+                                        ? query.OrderBy(s => s.Name)
+                                        : query.OrderByDescending(s => s.Name),
+            };
+            return query;
+        }
+
+        public async Task<Spell?> GetSpellByIdAsync(string id, CancellationToken cancellationToken)
         {
             return await _dbContext.Spells
                 .Include(s => s.Classes)
                 .Include(s => s.Subclasses)
                 .Include(s => s.School)
-                .FirstOrDefaultAsync(s => s.Id == id);
+                .FirstOrDefaultAsync(s => s.Id == id, cancellationToken);
         }
 
-        public async Task AddOrUpdateSpellAsync(SpellRequest request)
+        public async Task AddOrUpdateSpellAsync(SpellRequest request, CancellationToken cancellationToken)
         {
             // 1) Attempt to find the existing Spell
             var existingSpell = await _dbContext.Spells
                 .Include(s => s.Classes)
                 .Include(s => s.Subclasses)
                 .Include(s => s.School)  // optional if referencing School
-                .FirstOrDefaultAsync(s => s.Id == request.Id);
+                .FirstOrDefaultAsync(s => s.Id == request.Id, cancellationToken);
 
             // 2) If not found, create a brand-new Spell
             if (existingSpell is null)
@@ -64,7 +116,7 @@ namespace Infrastructure.Repositories
                 if (!string.IsNullOrEmpty(request.SchoolId))
                 {
                     var school = await _dbContext.Schools
-                        .FirstOrDefaultAsync(s => s.Id == request.SchoolId);
+                        .FirstOrDefaultAsync(s => s.Id == request.SchoolId, cancellationToken);
                     if (school != null)
                         newSpell.School = school;
                 }
@@ -74,7 +126,7 @@ namespace Infrastructure.Repositories
                 {
                     var classesToAdd = await _dbContext.Classes
                         .Where(c => request.ClassIds.Contains(c.Id))
-                        .ToListAsync();
+                        .ToListAsync(cancellationToken);
                     newSpell.Classes = classesToAdd;
                 }
 
@@ -83,7 +135,7 @@ namespace Infrastructure.Repositories
                 {
                     var subclassesToAdd = await _dbContext.Subclasses
                         .Where(sc => request.SubclassIds.Contains(sc.Id))
-                        .ToListAsync();
+                        .ToListAsync(cancellationToken);
                     newSpell.Subclasses = subclassesToAdd;
                 }
 
@@ -92,7 +144,8 @@ namespace Infrastructure.Repositories
             }
             else
             {
-                // 3) Update existing Spell
+                // 3) Update existing Spell - implementation remains the same
+                // ... (existing code unchanged)
                 existingSpell.Name = request.Name;
                 existingSpell.Desc = request.Desc;
                 existingSpell.HigherLevel = request.HigherLevel;
@@ -112,7 +165,7 @@ namespace Infrastructure.Repositories
                 if (!string.IsNullOrEmpty(request.SchoolId))
                 {
                     var school = await _dbContext.Schools
-                        .FirstOrDefaultAsync(s => s.Id == request.SchoolId);
+                        .FirstOrDefaultAsync(s => s.Id == request.SchoolId, cancellationToken);
                     existingSpell.School = school;
                 }
                 else
@@ -120,7 +173,7 @@ namespace Infrastructure.Repositories
                     existingSpell.School = null;
                 }
 
-                // 3a) Many-to-many for Classes (Approach B)
+                // 3a) Many-to-many for Classes
                 if (request.ClassIds != null)
                 {
                     var existingClassIds = existingSpell.Classes.Select(cls => cls.Id).ToList();
@@ -136,13 +189,13 @@ namespace Infrastructure.Repositories
                     {
                         var classesToAdd = await _dbContext.Classes
                             .Where(c => addedClassIds.Contains(c.Id))
-                            .ToListAsync();
+                            .ToListAsync(cancellationToken);
                         foreach (var cls in classesToAdd)
                             existingSpell.Classes.Add(cls);
                     }
                 }
 
-                // 3b) Many-to-many for Subclasses (Approach B)
+                // 3b) Many-to-many for Subclasses
                 if (request.SubclassIds != null)
                 {
                     var existingSubclassIds = existingSpell.Subclasses.Select(sc => sc.Id).ToList();
@@ -158,7 +211,7 @@ namespace Infrastructure.Repositories
                     {
                         var subclassesToAdd = await _dbContext.Subclasses
                             .Where(sc => addedSubclassIds.Contains(sc.Id))
-                            .ToListAsync();
+                            .ToListAsync(cancellationToken);
                         foreach (var sc in subclassesToAdd)
                             existingSpell.Subclasses.Add(sc);
                     }
@@ -166,7 +219,7 @@ namespace Infrastructure.Repositories
             }
 
             // 4) Save changes
-            await _dbContext.SaveChangesAsync();
+            await _dbContext.SaveChangesAsync(cancellationToken);
         }
     }
 }
