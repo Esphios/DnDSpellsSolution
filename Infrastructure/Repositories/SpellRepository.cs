@@ -1,225 +1,180 @@
-﻿using ApplicationCore.Entities;
-using ApplicationCore.Interfaces.Repositories;
 using ApplicationCore.Dtos;
+using ApplicationCore.Entities;
+using ApplicationCore.Interfaces.Repositories;
 using Infrastructure.Data;
 using Microsoft.EntityFrameworkCore;
-using System.Linq.Expressions;
 
-namespace Infrastructure.Repositories
+namespace Infrastructure.Repositories;
+
+public class SpellRepository(ApplicationDbContext dbContext) : ISpellRepository
 {
-    public class SpellRepository(ApplicationDbContext dbContext) : ISpellRepository
+    private readonly ApplicationDbContext _dbContext = dbContext;
+
+    public async Task<(IEnumerable<Spell> Spells, int TotalItems, int CurrentPage)> GetAllSpellsAsync(
+        int page, int pageSize, string? filter, string? sortBy, string? sortDirection, CancellationToken cancellationToken)
     {
-        private readonly ApplicationDbContext _dbContext = dbContext;
+        IQueryable<Spell> query = _dbContext.Spells
+            .Include(s => s.Classes)
+            .Include(s => s.School)
+            .AsNoTracking();
 
-        public async Task<(IEnumerable<Spell> Spells, int TotalItems, int CurrentPage)> GetAllSpellsAsync(
-            int page, int pageSize, string? filter, string? sortBy, string? sortDirection, CancellationToken cancellationToken)
+        if (!string.IsNullOrEmpty(filter))
         {
-            var query = _dbContext.Spells
-                .Include(s => s.Classes)
-                .Include(s => s.School)
-                .AsNoTracking();
-
-            // Apply filter if provided
-            if (!string.IsNullOrEmpty(filter))
-            {
-                query = query.Where(s => s.Name.Contains(filter));
-            }
-
-            // Apply sorting
-            query = ApplySorting(query, sortBy, sortDirection);
-
-            // Get total count for pagination
-            int totalItems = await query.CountAsync(cancellationToken);
-
-            // Apply pagination
-            var spells = await query.Skip((page - 1) * pageSize).Take(pageSize).ToListAsync(cancellationToken);
-
-            return (spells, totalItems, page);
+            query = query.Where(s => s.Name.Contains(filter));
         }
 
-        private static IQueryable<Spell> ApplySorting(IQueryable<Spell> query, string? sortBy, string? sortDirection)
+        query = ApplySorting(query, sortBy, sortDirection);
+
+        int totalItems = await query.CountAsync(cancellationToken);
+        List<Spell> spells = await query.Skip((page - 1) * pageSize).Take(pageSize).ToListAsync(cancellationToken);
+
+        return (spells, totalItems, page);
+    }
+
+    private static IQueryable<Spell> ApplySorting(IQueryable<Spell> query, string? sortBy, string? sortDirection)
+    {
+        sortBy ??= "name";
+        bool isAscending = string.IsNullOrEmpty(sortDirection) || sortDirection.Equals("asc", StringComparison.CurrentCultureIgnoreCase);
+
+        query = sortBy.ToLower() switch
         {
-            // Default sort
-            if (string.IsNullOrEmpty(sortBy))
-            {
-                sortBy = "name";
-            }
+            "name" => isAscending ? query.OrderBy(s => s.Name) : query.OrderByDescending(s => s.Name),
+            "level" => isAscending ? query.OrderBy(s => s.Level) : query.OrderByDescending(s => s.Level),
+            "class" => isAscending
+                ? query.OrderBy(s => s.Classes.OrderBy(c => c.Name).Select(c => c.Name).FirstOrDefault() ?? string.Empty)
+                : query.OrderByDescending(s => s.Classes.OrderBy(c => c.Name).Select(c => c.Name).FirstOrDefault() ?? string.Empty),
+            _ => isAscending ? query.OrderBy(s => s.Name) : query.OrderByDescending(s => s.Name),
+        };
 
-            bool isAscending = string.IsNullOrEmpty(sortDirection) || sortDirection.Equals("asc", StringComparison.CurrentCultureIgnoreCase);
+        return query;
+    }
 
-            // Apply sorting based on column
-            query = sortBy.ToLower() switch
-            {
-                "name" => isAscending
-                                        ? query.OrderBy(s => s.Name)
-                                        : query.OrderByDescending(s => s.Name),
-                "level" => isAscending
-                                        ? query.OrderBy(s => s.Level)
-                                        : query.OrderByDescending(s => s.Level),
-                "class" => isAscending
-                                        ? query.OrderBy(s => 
-                                            s.Classes.OrderBy(c => c.Name)
-                                                     .Select(c => c.Name)
-                                                     .FirstOrDefault() ?? string.Empty)
-                                        : query.OrderByDescending(s => 
-                                            s.Classes.OrderBy(c => c.Name)
-                                                     .Select(c => c.Name)
-                                                     .FirstOrDefault() ?? string.Empty),
-                _ => isAscending
-                                        ? query.OrderBy(s => s.Name)
-                                        : query.OrderByDescending(s => s.Name),
-            };
-            return query;
+    public async Task<Spell?> GetSpellByIdAsync(string id, CancellationToken cancellationToken)
+    {
+        return await _dbContext.Spells
+            .Include(s => s.Classes)
+            .Include(s => s.Subclasses)
+            .Include(s => s.School)
+            .FirstOrDefaultAsync(s => s.Id == id, cancellationToken);
+    }
+
+    public async Task AddOrUpdateSpellAsync(SpellRequest request, CancellationToken cancellationToken)
+    {
+        Spell? existingSpell = await _dbContext.Spells
+            .Include(s => s.Classes)
+            .Include(s => s.Subclasses)
+            .Include(s => s.School)
+            .FirstOrDefaultAsync(s => s.Id == request.Id, cancellationToken);
+
+        if (existingSpell is null)
+        {
+            Spell newSpell = await CreateSpellAsync(request, cancellationToken);
+            _ = _dbContext.Spells.Add(newSpell);
+        }
+        else
+        {
+            await UpdateSpellAsync(existingSpell, request, cancellationToken);
         }
 
-        public async Task<Spell?> GetSpellByIdAsync(string id, CancellationToken cancellationToken)
+        _ = await _dbContext.SaveChangesAsync(cancellationToken);
+    }
+
+    private async Task<Spell> CreateSpellAsync(SpellRequest request, CancellationToken cancellationToken)
+    {
+        Spell newSpell = MapSpell(request, new Spell { Id = request.Id });
+        newSpell.School = await GetSchoolAsync(request.SchoolId, cancellationToken);
+        newSpell.Classes = await GetClassesAsync(request.ClassIds, cancellationToken);
+        newSpell.Subclasses = await GetSubclassesAsync(request.SubclassIds, cancellationToken);
+        return newSpell;
+    }
+
+    private async Task UpdateSpellAsync(Spell existingSpell, SpellRequest request, CancellationToken cancellationToken)
+    {
+        _ = MapSpell(request, existingSpell);
+        existingSpell.School = await GetSchoolAsync(request.SchoolId, cancellationToken);
+
+        await UpdateRelationshipsAsync(
+            existingSpell.Classes,
+            request.ClassIds,
+            ids => _dbContext.Classes.Where(c => ids.Contains(c.Id)).ToListAsync(cancellationToken));
+
+        await UpdateRelationshipsAsync(
+            existingSpell.Subclasses,
+            request.SubclassIds,
+            ids => _dbContext.Subclasses.Where(sc => ids.Contains(sc.Id)).ToListAsync(cancellationToken));
+    }
+
+    private static Spell MapSpell(SpellRequest request, Spell spell)
+    {
+        spell.Name = request.Name;
+        spell.Desc = request.Desc;
+        spell.HigherLevel = request.HigherLevel;
+        spell.Range = request.Range;
+        spell.Components = request.Components;
+        spell.Material = request.Material;
+        spell.Ritual = request.Ritual;
+        spell.Duration = request.Duration;
+        spell.Concentration = request.Concentration;
+        spell.CastingTime = request.CastingTime;
+        spell.Level = request.Level;
+        spell.AttackType = request.AttackType;
+        spell.Url = request.Url;
+        spell.UpdatedAt = request.UpdatedAt ?? DateTime.Now;
+        return spell;
+    }
+
+    private async Task<School?> GetSchoolAsync(string? schoolId, CancellationToken cancellationToken)
+    {
+        if (string.IsNullOrEmpty(schoolId))
         {
-            return await _dbContext.Spells
-                .Include(s => s.Classes)
-                .Include(s => s.Subclasses)
-                .Include(s => s.School)
-                .FirstOrDefaultAsync(s => s.Id == id, cancellationToken);
+            return null;
         }
 
-        public async Task AddOrUpdateSpellAsync(SpellRequest request, CancellationToken cancellationToken)
+        return await _dbContext.Schools.FirstOrDefaultAsync(s => s.Id == schoolId, cancellationToken);
+    }
+
+    private async Task<List<Class>> GetClassesAsync(List<string>? classIds, CancellationToken cancellationToken)
+    {
+        if (classIds is not { Count: > 0 })
         {
-            // 1) Attempt to find the existing Spell
-            var existingSpell = await _dbContext.Spells
-                .Include(s => s.Classes)
-                .Include(s => s.Subclasses)
-                .Include(s => s.School)  // optional if referencing School
-                .FirstOrDefaultAsync(s => s.Id == request.Id, cancellationToken);
-
-            // 2) If not found, create a brand-new Spell
-            if (existingSpell is null)
-            {
-                var newSpell = new Spell
-                {
-                    Id = request.Id,
-                    Name = request.Name,
-                    Desc = request.Desc,
-                    HigherLevel = request.HigherLevel,
-                    Range = request.Range,
-                    Components = request.Components,
-                    Material = request.Material,
-                    Ritual = request.Ritual,
-                    Duration = request.Duration,
-                    Concentration = request.Concentration,
-                    CastingTime = request.CastingTime,
-                    Level = request.Level,
-                    AttackType = request.AttackType,
-                    Url = request.Url,
-                    UpdatedAt = request.UpdatedAt ?? DateTime.Now
-                };
-
-                // 2a) If user supplies a SchoolId, link the corresponding School
-                if (!string.IsNullOrEmpty(request.SchoolId))
-                {
-                    var school = await _dbContext.Schools
-                        .FirstOrDefaultAsync(s => s.Id == request.SchoolId, cancellationToken);
-                    if (school != null)
-                        newSpell.School = school;
-                }
-
-                // 2b) Many-to-many: link to Classes
-                if (request.ClassIds?.Count > 0)
-                {
-                    var classesToAdd = await _dbContext.Classes
-                        .Where(c => request.ClassIds.Contains(c.Id))
-                        .ToListAsync(cancellationToken);
-                    newSpell.Classes = classesToAdd;
-                }
-
-                // 2c) Many-to-many: link to Subclasses
-                if (request.SubclassIds?.Count > 0)
-                {
-                    var subclassesToAdd = await _dbContext.Subclasses
-                        .Where(sc => request.SubclassIds.Contains(sc.Id))
-                        .ToListAsync(cancellationToken);
-                    newSpell.Subclasses = subclassesToAdd;
-                }
-
-                // Finally add the new Spell
-                _dbContext.Spells.Add(newSpell);
-            }
-            else
-            {
-                // 3) Update existing Spell - implementation remains the same
-                // ... (existing code unchanged)
-                existingSpell.Name = request.Name;
-                existingSpell.Desc = request.Desc;
-                existingSpell.HigherLevel = request.HigherLevel;
-                existingSpell.Range = request.Range;
-                existingSpell.Components = request.Components;
-                existingSpell.Material = request.Material;
-                existingSpell.Ritual = request.Ritual;
-                existingSpell.Duration = request.Duration;
-                existingSpell.Concentration = request.Concentration;
-                existingSpell.CastingTime = request.CastingTime;
-                existingSpell.Level = request.Level;
-                existingSpell.AttackType = request.AttackType;
-                existingSpell.Url = request.Url;
-                existingSpell.UpdatedAt = request.UpdatedAt ?? DateTime.Now;
-
-                // School reference
-                if (!string.IsNullOrEmpty(request.SchoolId))
-                {
-                    var school = await _dbContext.Schools
-                        .FirstOrDefaultAsync(s => s.Id == request.SchoolId, cancellationToken);
-                    existingSpell.School = school;
-                }
-                else
-                {
-                    existingSpell.School = null;
-                }
-
-                // 3a) Many-to-many for Classes
-                if (request.ClassIds != null)
-                {
-                    var existingClassIds = existingSpell.Classes.Select(cls => cls.Id).ToList();
-                    var newClassIds = request.ClassIds;
-
-                    // Remove missing
-                    var removedClassIds = existingClassIds.Except(newClassIds).ToList();
-                    existingSpell.Classes.RemoveAll(c => removedClassIds.Contains(c.Id));
-
-                    // Add newly introduced
-                    var addedClassIds = newClassIds.Except(existingClassIds).ToList();
-                    if (addedClassIds.Count > 0)
-                    {
-                        var classesToAdd = await _dbContext.Classes
-                            .Where(c => addedClassIds.Contains(c.Id))
-                            .ToListAsync(cancellationToken);
-                        foreach (var cls in classesToAdd)
-                            existingSpell.Classes.Add(cls);
-                    }
-                }
-
-                // 3b) Many-to-many for Subclasses
-                if (request.SubclassIds != null)
-                {
-                    var existingSubclassIds = existingSpell.Subclasses.Select(sc => sc.Id).ToList();
-                    var newSubclassIds = request.SubclassIds;
-
-                    // Remove missing
-                    var removedSubclassIds = existingSubclassIds.Except(newSubclassIds).ToList();
-                    existingSpell.Subclasses.RemoveAll(sc => removedSubclassIds.Contains(sc.Id));
-
-                    // Add newly introduced
-                    var addedSubclassIds = newSubclassIds.Except(existingSubclassIds).ToList();
-                    if (addedSubclassIds.Count > 0)
-                    {
-                        var subclassesToAdd = await _dbContext.Subclasses
-                            .Where(sc => addedSubclassIds.Contains(sc.Id))
-                            .ToListAsync(cancellationToken);
-                        foreach (var sc in subclassesToAdd)
-                            existingSpell.Subclasses.Add(sc);
-                    }
-                }
-            }
-
-            // 4) Save changes
-            await _dbContext.SaveChangesAsync(cancellationToken);
+            return [];
         }
+
+        return await _dbContext.Classes.Where(c => classIds.Contains(c.Id)).ToListAsync(cancellationToken);
+    }
+
+    private async Task<List<Subclass>> GetSubclassesAsync(List<string>? subclassIds, CancellationToken cancellationToken)
+    {
+        if (subclassIds is not { Count: > 0 })
+        {
+            return [];
+        }
+
+        return await _dbContext.Subclasses.Where(sc => subclassIds.Contains(sc.Id)).ToListAsync(cancellationToken);
+    }
+
+    private static async Task UpdateRelationshipsAsync<TEntity>(
+        List<TEntity> existingEntities,
+        List<string>? requestedIds,
+        Func<List<string>, Task<List<TEntity>>> fetchEntitiesAsync)
+        where TEntity : class, IHasStringId
+    {
+        if (requestedIds is null)
+        {
+            return;
+        }
+
+        HashSet<string> requestedIdSet = [.. requestedIds];
+        _ = existingEntities.RemoveAll(entity => !requestedIdSet.Contains(entity.Id));
+
+        List<string> existingIds = [.. existingEntities.Select(entity => entity.Id)];
+        List<string> missingIds = [.. requestedIdSet.Except(existingIds)];
+        if (missingIds.Count == 0)
+        {
+            return;
+        }
+
+        List<TEntity> entitiesToAdd = await fetchEntitiesAsync(missingIds);
+        existingEntities.AddRange(entitiesToAdd);
     }
 }

@@ -1,259 +1,283 @@
-﻿using ApplicationCore.Dtos;
+using ApplicationCore.Dtos;
 using ApplicationCore.Entities;
 using Infrastructure.Data;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Logging;
 using Newtonsoft.Json;
 
-namespace HangfireJobs.Services
+namespace HangfireJobs.Services;
+
+public class SpellUpsertJob(HttpClient httpClient, ApplicationDbContext dbContext, ILogger<SpellUpsertJob> logger)
 {
-    public class SpellUpsertJob(HttpClient httpClient, ApplicationDbContext dbContext, ILogger<SpellUpsertJob> logger)
+    private const string SpellIndexPath = "/api/spells";
+
+    private readonly HttpClient _httpClient = httpClient;
+    private readonly ApplicationDbContext _dbContext = dbContext;
+    private readonly ILogger<SpellUpsertJob> _logger = logger;
+
+    private readonly Dictionary<string, School> _schools = [];
+    private readonly Dictionary<string, Class> _classes = [];
+    private readonly Dictionary<string, Subclass> _subclasses = [];
+    private readonly Dictionary<string, Damage> _damages = [];
+    private readonly Dictionary<string, DamageType> _damageTypes = [];
+    private readonly Dictionary<string, DamageAtSlotLevel> _damageAtSlotLevels = [];
+
+    public async Task ExecuteAsync(CancellationToken stoppingToken)
     {
-        private readonly HttpClient _httpClient = httpClient;
-        private readonly ApplicationDbContext _dbContext = dbContext;
-        private readonly ILogger<SpellUpsertJob> _logger = logger;
-
-        // In-memory dictionaries to avoid duplications when re-inserting
-        private readonly Dictionary<string, School> _schools = [];
-        private readonly Dictionary<string, Class> _classes = [];
-        private readonly Dictionary<string, Subclass> _subclasses = [];
-        private readonly Dictionary<string, Damage> _damages = [];
-        private readonly Dictionary<string, DamageType> _damageTypes = [];
-        private readonly Dictionary<string, DamageAtSlotLevel> _damageAtSlotLevels = [];
-
-        public async Task ExecuteAsync(CancellationToken stoppingToken)
+        if (_logger.IsEnabled(LogLevel.Information))
         {
-            _logger.LogInformation("Spell refresh job started at: {time}", DateTimeOffset.Now);
+            _logger.LogInformation("Spell refresh job started at: {Time}", DateTimeOffset.Now);
+        }
 
-            try
+        try
+        {
+            await DeleteAllDataAsync(stoppingToken);
+
+            string response = await _httpClient.GetStringAsync(SpellIndexPath, stoppingToken);
+            SpellApiResponse? spellData = JsonConvert.DeserializeObject<SpellApiResponse>(response);
+            if (spellData?.Results == null || spellData.Results.Count == 0)
             {
-                // 1) Completely delete existing data via raw SQL
-                await DeleteAllDataAsync(stoppingToken);
-
-                // 2) Fetch the main spells index from the DnD 5e API
-                var response = await _httpClient.GetStringAsync("https://www.dnd5eapi.co/api/spells", stoppingToken);
-                var spellData = JsonConvert.DeserializeObject<SpellAPIResponse>(response);
-                if (spellData?.Results == null || spellData.Results.Count == 0)
-                {
-                    _logger.LogWarning("No spells returned from the API.");
-                    return;
-                }
-
-                var newSpells = new List<Spell>();
-
-                // 3) For each spell, fetch details and build new objects
-                foreach (var spellSummary in spellData.Results)
-                {
-                    try
-                    {
-                        var detailResponse = await _httpClient.GetStringAsync(
-                            $"https://www.dnd5eapi.co{spellSummary.Url}",
-                            stoppingToken
-                        );
-
-                        var fullSpell = JsonConvert.DeserializeObject<Spell>(detailResponse);
-                        if (fullSpell == null)
-                        {
-                            _logger.LogWarning("Spell detail could not be parsed: {spellName}", spellSummary.Name);
-                            continue;
-                        }
-
-                        // Make sure they're non-null
-                        fullSpell.Classes ??= [];
-                        fullSpell.Subclasses ??= [];
-                        fullSpell.Damage ??= new();
-
-                        // School
-                        if (fullSpell.School != null)
-                            fullSpell.School = GetOrCreateSchool(fullSpell.School);
-
-                        // Classes
-                        var classList = new List<Class>();
-                        foreach (var c in fullSpell.Classes)
-                            classList.Add(GetOrCreateClass(c));
-                        fullSpell.Classes = classList;
-
-                        // Subclasses
-                        var subclassList = new List<Subclass>();
-                        foreach (var sc in fullSpell.Subclasses)
-                            subclassList.Add(GetOrCreateSubclass(sc));
-                        fullSpell.Subclasses = subclassList;
-
-                        // Damage (DamageType, DamageAtSlotLevel)
-                        if (fullSpell.Damage != null)
-                            fullSpell.Damage = GetOrCreateDamage(fullSpell.Damage);
-
-                        newSpells.Add(fullSpell);
-                    }
-                    catch (Exception ex2)
-                    {
-                        _logger.LogError(ex2, "Error processing spell {spellName}", spellSummary.Name);
-                    }
-                }
-
-                // 4) Insert the distinct references from dictionaries
-                _dbContext.Schools.AddRange(_schools.Values);
-                _dbContext.Classes.AddRange(_classes.Values);
-                _dbContext.Subclasses.AddRange(_subclasses.Values);
-                _dbContext.DamageTypes.AddRange(_damageTypes.Values);
-                _dbContext.DamageAtSlotLevels.AddRange(_damageAtSlotLevels.Values);
-                _dbContext.Damages.AddRange(_damages.Values);
-
-                // 5) Insert all spells
-                _dbContext.Spells.AddRange(newSpells);
-
-                // 6) Save once
-                await _dbContext.SaveChangesAsync(stoppingToken);
-
-                _logger.LogInformation("Spell refresh completed successfully at: {time}", DateTimeOffset.Now);
+                _logger.LogWarning("No spells returned from the API.");
+                return;
             }
-            catch (Exception ex)
+
+            List<Spell> newSpells = await BuildSpellsAsync(spellData.Results, stoppingToken);
+
+            _dbContext.Schools.AddRange(_schools.Values);
+            _dbContext.Classes.AddRange(_classes.Values);
+            _dbContext.Subclasses.AddRange(_subclasses.Values);
+            _dbContext.DamageTypes.AddRange(_damageTypes.Values);
+            _dbContext.DamageAtSlotLevels.AddRange(_damageAtSlotLevels.Values);
+            _dbContext.Damages.AddRange(_damages.Values);
+            _dbContext.Spells.AddRange(newSpells);
+
+            _ = await _dbContext.SaveChangesAsync(stoppingToken);
+
+            if (_logger.IsEnabled(LogLevel.Information))
             {
-                _logger.LogError(ex, "Error refreshing spells");
+                _logger.LogInformation("Spell refresh completed successfully at: {Time}", DateTimeOffset.Now);
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Error refreshing spells");
+        }
+    }
+
+    private async Task DeleteAllDataAsync(CancellationToken ct)
+    {
+        _logger.LogInformation("Deleting all spell-related data via raw SQL...");
+
+        _ = await _dbContext.Database.ExecuteSqlRawAsync("DELETE FROM [Subclasses]", ct);
+        _ = await _dbContext.Database.ExecuteSqlRawAsync("DELETE FROM [Spells]", ct);
+        _ = await _dbContext.Database.ExecuteSqlRawAsync("DELETE FROM [Damages]", ct);
+        _ = await _dbContext.Database.ExecuteSqlRawAsync("DELETE FROM [DamageTypes]", ct);
+        _ = await _dbContext.Database.ExecuteSqlRawAsync("DELETE FROM [DamageAtSlotLevels]", ct);
+        _ = await _dbContext.Database.ExecuteSqlRawAsync("DELETE FROM [Schools]", ct);
+        _ = await _dbContext.Database.ExecuteSqlRawAsync("DELETE FROM [Classes]", ct);
+
+        _logger.LogInformation("All related tables cleared via DELETE.");
+    }
+
+    private async Task<List<Spell>> BuildSpellsAsync(IEnumerable<SpellSummary> spellSummaries, CancellationToken stoppingToken)
+    {
+        List<Spell> newSpells = [];
+
+        foreach (SpellSummary spellSummary in spellSummaries)
+        {
+            Spell? spell = await TryBuildSpellAsync(spellSummary, stoppingToken);
+            if (spell != null)
+            {
+                newSpells.Add(spell);
             }
         }
 
-        /// <summary>
-        /// Deletes all data from the spell-related tables, in an order that avoids FK conflicts.
-        /// If you see foreign key errors, rearrange this order to first delete “sub” or “many-to-many” tables.
-        /// </summary>
-        private async Task DeleteAllDataAsync(CancellationToken ct)
+        return newSpells;
+    }
+
+    private async Task<Spell?> TryBuildSpellAsync(SpellSummary spellSummary, CancellationToken stoppingToken)
+    {
+        try
         {
-            _logger.LogInformation("Deleting all spell-related data via raw SQL...");
-
-            await _dbContext.Database.ExecuteSqlRawAsync("DELETE FROM [Subclasses]", ct);
-            await _dbContext.Database.ExecuteSqlRawAsync("DELETE FROM [Spells]", ct);
-            await _dbContext.Database.ExecuteSqlRawAsync("DELETE FROM [Damages]", ct);
-            await _dbContext.Database.ExecuteSqlRawAsync("DELETE FROM [DamageTypes]", ct);
-            await _dbContext.Database.ExecuteSqlRawAsync("DELETE FROM [DamageAtSlotLevels]", ct);
-            await _dbContext.Database.ExecuteSqlRawAsync("DELETE FROM [Schools]", ct);
-            await _dbContext.Database.ExecuteSqlRawAsync("DELETE FROM [Classes]", ct);
-            _logger.LogInformation("All related tables cleared via DELETE.");
-        }
-
-        // =============================================
-        // Helpers for in-memory deduplication
-        // =============================================
-        private School GetOrCreateSchool(School s)
-        {
-            if (string.IsNullOrWhiteSpace(s.Id))
-                s.Id = Guid.NewGuid().ToString();
-
-            if (!_schools.TryGetValue(s.Id, out var existing))
+            string detailResponse = await _httpClient.GetStringAsync(spellSummary.Url, stoppingToken);
+            Spell? fullSpell = JsonConvert.DeserializeObject<Spell>(detailResponse);
+            if (fullSpell == null)
             {
-                existing = new School
-                {
-                    Id = s.Id,
-                    Name = s.Name,
-                    Url = s.Url
-                };
-                _schools[s.Id] = existing;
+                _logger.LogWarning("Spell detail could not be parsed: {SpellName}", spellSummary.Name);
+                return null;
             }
-            return existing;
-        }
 
-        private Class GetOrCreateClass(Class c)
+            NormalizeSpellReferences(fullSpell);
+            return fullSpell;
+        }
+        catch (Exception ex)
         {
-            if (string.IsNullOrWhiteSpace(c.Id))
-                c.Id = Guid.NewGuid().ToString();
-
-            if (!_classes.TryGetValue(c.Id, out var existing))
-            {
-                existing = new Class
-                {
-                    Id = c.Id,
-                    Name = c.Name,
-                    Url = c.Url
-                };
-                _classes[c.Id] = existing;
-            }
-            return existing;
+            _logger.LogError(ex, "Error processing spell {SpellName}", spellSummary.Name);
+            return null;
         }
+    }
 
-        private Subclass GetOrCreateSubclass(Subclass sc)
+    private void NormalizeSpellReferences(Spell spell)
+    {
+        spell.Classes ??= [];
+        spell.Subclasses ??= [];
+        spell.Damage ??= new();
+
+        if (spell.School != null)
         {
-            if (string.IsNullOrWhiteSpace(sc.Id))
-                sc.Id = Guid.NewGuid().ToString();
-
-            if (!_subclasses.TryGetValue(sc.Id, out var existing))
-            {
-                existing = new Subclass
-                {
-                    Id = sc.Id,
-                    Name = sc.Name,
-                    Url = sc.Url
-                };
-                _subclasses[sc.Id] = existing;
-            }
-            return existing;
+            spell.School = GetOrCreateSchool(spell.School);
         }
 
-        private Damage GetOrCreateDamage(Damage dmg)
+        spell.Classes = [.. spell.Classes.Select(GetOrCreateClass)];
+        spell.Subclasses = [.. spell.Subclasses.Select(GetOrCreateSubclass)];
+
+        if (spell.Damage != null)
         {
-            if (string.IsNullOrWhiteSpace(dmg.Id))
-                dmg.Id = Guid.NewGuid().ToString();
-
-            if (dmg.DamageType != null)
-                dmg.DamageType = GetOrCreateDamageType(dmg.DamageType);
-
-            if (dmg.DamageAtSlotLevel != null)
-                dmg.DamageAtSlotLevel = GetOrCreateDamageAtSlotLevel(dmg.DamageAtSlotLevel);
-
-            if (!_damages.TryGetValue(dmg.Id, out var existing))
-            {
-                existing = new Damage
-                {
-                    Id = dmg.Id,
-                    DamageType = dmg.DamageType,
-                    DamageAtSlotLevel = dmg.DamageAtSlotLevel
-                };
-                _damages[dmg.Id] = existing;
-            }
-            return existing;
+            spell.Damage = GetOrCreateDamage(spell.Damage);
         }
+    }
 
-        private DamageType GetOrCreateDamageType(DamageType dt)
+    private School GetOrCreateSchool(School school)
+    {
+        if (string.IsNullOrWhiteSpace(school.Id))
         {
-            if (string.IsNullOrWhiteSpace(dt.Id))
-                dt.Id = Guid.NewGuid().ToString();
-
-            if (!_damageTypes.TryGetValue(dt.Id, out var existing))
-            {
-                existing = new DamageType
-                {
-                    Id = dt.Id,
-                    Name = dt.Name,
-                    Url = dt.Url
-                };
-                _damageTypes[dt.Id] = existing;
-            }
-            return existing;
+            school.Id = Guid.NewGuid().ToString();
         }
 
-        private DamageAtSlotLevel GetOrCreateDamageAtSlotLevel(DamageAtSlotLevel dasl)
+        if (!_schools.TryGetValue(school.Id, out School? existing))
         {
-            if (string.IsNullOrWhiteSpace(dasl.Id))
-                dasl.Id = Guid.NewGuid().ToString();
-
-            if (!_damageAtSlotLevels.TryGetValue(dasl.Id, out var existing))
+            existing = new School
             {
-                existing = new DamageAtSlotLevel
-                {
-                    Id = dasl.Id,
-                    _0 = dasl._0,
-                    _1 = dasl._1,
-                    _2 = dasl._2,
-                    _3 = dasl._3,
-                    _4 = dasl._4,
-                    _5 = dasl._5,
-                    _6 = dasl._6,
-                    _7 = dasl._7,
-                    _8 = dasl._8,
-                    _9 = dasl._9
-                };
-                _damageAtSlotLevels[dasl.Id] = existing;
-            }
-            return existing;
+                Id = school.Id,
+                Name = school.Name,
+                Url = school.Url
+            };
+            _schools[school.Id] = existing;
         }
+
+        return existing;
+    }
+
+    private Class GetOrCreateClass(Class @class)
+    {
+        if (string.IsNullOrWhiteSpace(@class.Id))
+        {
+            @class.Id = Guid.NewGuid().ToString();
+        }
+
+        if (!_classes.TryGetValue(@class.Id, out Class? existing))
+        {
+            existing = new Class
+            {
+                Id = @class.Id,
+                Name = @class.Name,
+                Url = @class.Url
+            };
+            _classes[@class.Id] = existing;
+        }
+
+        return existing;
+    }
+
+    private Subclass GetOrCreateSubclass(Subclass subclass)
+    {
+        if (string.IsNullOrWhiteSpace(subclass.Id))
+        {
+            subclass.Id = Guid.NewGuid().ToString();
+        }
+
+        if (!_subclasses.TryGetValue(subclass.Id, out Subclass? existing))
+        {
+            existing = new Subclass
+            {
+                Id = subclass.Id,
+                Name = subclass.Name,
+                Url = subclass.Url
+            };
+            _subclasses[subclass.Id] = existing;
+        }
+
+        return existing;
+    }
+
+    private Damage GetOrCreateDamage(Damage damage)
+    {
+        if (string.IsNullOrWhiteSpace(damage.Id))
+        {
+            damage.Id = Guid.NewGuid().ToString();
+        }
+
+        if (damage.DamageType != null)
+        {
+            damage.DamageType = GetOrCreateDamageType(damage.DamageType);
+        }
+
+        if (damage.DamageAtSlotLevel != null)
+        {
+            damage.DamageAtSlotLevel = GetOrCreateDamageAtSlotLevel(damage.DamageAtSlotLevel);
+        }
+
+        if (!_damages.TryGetValue(damage.Id, out Damage? existing))
+        {
+            existing = new Damage
+            {
+                Id = damage.Id,
+                DamageType = damage.DamageType,
+                DamageAtSlotLevel = damage.DamageAtSlotLevel
+            };
+            _damages[damage.Id] = existing;
+        }
+
+        return existing;
+    }
+
+    private DamageType GetOrCreateDamageType(DamageType damageType)
+    {
+        if (string.IsNullOrWhiteSpace(damageType.Id))
+        {
+            damageType.Id = Guid.NewGuid().ToString();
+        }
+
+        if (!_damageTypes.TryGetValue(damageType.Id, out DamageType? existing))
+        {
+            existing = new DamageType
+            {
+                Id = damageType.Id,
+                Name = damageType.Name,
+                Url = damageType.Url
+            };
+            _damageTypes[damageType.Id] = existing;
+        }
+
+        return existing;
+    }
+
+    private DamageAtSlotLevel GetOrCreateDamageAtSlotLevel(DamageAtSlotLevel damageAtSlotLevel)
+    {
+        if (string.IsNullOrWhiteSpace(damageAtSlotLevel.Id))
+        {
+            damageAtSlotLevel.Id = Guid.NewGuid().ToString();
+        }
+
+        if (!_damageAtSlotLevels.TryGetValue(damageAtSlotLevel.Id, out DamageAtSlotLevel? existing))
+        {
+            existing = new DamageAtSlotLevel
+            {
+                Id = damageAtSlotLevel.Id,
+                _0 = damageAtSlotLevel._0,
+                _1 = damageAtSlotLevel._1,
+                _2 = damageAtSlotLevel._2,
+                _3 = damageAtSlotLevel._3,
+                _4 = damageAtSlotLevel._4,
+                _5 = damageAtSlotLevel._5,
+                _6 = damageAtSlotLevel._6,
+                _7 = damageAtSlotLevel._7,
+                _8 = damageAtSlotLevel._8,
+                _9 = damageAtSlotLevel._9
+            };
+            _damageAtSlotLevels[damageAtSlotLevel.Id] = existing;
+        }
+
+        return existing;
     }
 }

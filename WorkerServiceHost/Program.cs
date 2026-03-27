@@ -5,24 +5,27 @@ using Infrastructure.Data;
 using Infrastructure.Repositories;
 using Microsoft.EntityFrameworkCore;
 
-var builder = Host.CreateDefaultBuilder(args)
+IHostBuilder builder = Host.CreateDefaultBuilder(args)
     .ConfigureServices((hostContext, services) =>
     {
+        string dnd5eBaseUrl = hostContext.Configuration["ExternalApis:Dnd5e:BaseUrl"]
+            ?? throw new InvalidOperationException("Missing configuration: ExternalApis:Dnd5e:BaseUrl");
+
         // 1) Register DbContext
-        services.AddDbContext<ApplicationDbContext>(options =>
+        _ = services.AddDbContext<ApplicationDbContext>(options =>
             options.UseSqlServer(
                 hostContext.Configuration.GetConnectionString("DefaultConnection")));
 
         // 2) Add Hangfire + HangfireServer
-        services.AddHangfire(config =>
+        _ = services.AddHangfire(config =>
         {
             // Use SQL Server. ConnectionString must match your DB
-            config.UseSqlServerStorage(
+            _ = config.UseSqlServerStorage(
                 hostContext.Configuration.GetConnectionString("DefaultConnection"));
         });
 
         // Optionally specify server options:
-        services.AddHangfireServer(options =>
+        _ = services.AddHangfireServer(options =>
         {
             options.ServerName = "DnDSpellsWorker";
             options.Queues = ["default"];
@@ -30,29 +33,32 @@ var builder = Host.CreateDefaultBuilder(args)
         });
 
         // 3) Register dependencies
-        services.AddHttpClient<SpellUpsertJob>();
-        services.AddScoped<ISpellRepository, SpellRepository>();
-        services.AddScoped<SpellUpsertJob>();
+        _ = services.AddHttpClient<SpellUpsertJob>(client =>
+        {
+            client.BaseAddress = new Uri(dnd5eBaseUrl);
+        });
+        _ = services.AddScoped<ISpellRepository, SpellRepository>();
+        _ = services.AddScoped<SpellUpsertJob>();
     });
 
-var app = builder.Build();
+IHost app = builder.Build();
 
 // 4) Use a scope to configure jobs after the Host is built
-using (var scope = app.Services.CreateScope())
+using (IServiceScope scope = app.Services.CreateScope())
 {
-    var env = scope.ServiceProvider.GetRequiredService<IHostEnvironment>();
+    IHostEnvironment env = scope.ServiceProvider.GetRequiredService<IHostEnvironment>();
 
     if (env.IsDevelopment())
     {
         // DEVELOPMENT ENVIRONMENT: run the job once immediately
         // Use IBackgroundJobClient (instead of static BackgroundJob.Enqueue)
-        var backgroundJobs = scope.ServiceProvider.GetRequiredService<IBackgroundJobClient>();
-        backgroundJobs.Enqueue<SpellUpsertJob>(job => job.ExecuteAsync(CancellationToken.None));
+        IBackgroundJobClient backgroundJobs = scope.ServiceProvider.GetRequiredService<IBackgroundJobClient>();
+        _ = backgroundJobs.Enqueue<SpellUpsertJob>(job => job.ExecuteAsync(CancellationToken.None));
     }
     else
     {
         // PRODUCTION (or other env): schedule recurring job
-        var recurringJobManager = scope.ServiceProvider.GetRequiredService<IRecurringJobManager>();
+        IRecurringJobManager recurringJobManager = scope.ServiceProvider.GetRequiredService<IRecurringJobManager>();
         recurringJobManager.AddOrUpdate<SpellUpsertJob>(
             "spell-upsert-job",
             job => job.ExecuteAsync(CancellationToken.None),

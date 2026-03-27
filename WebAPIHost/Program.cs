@@ -1,10 +1,10 @@
+using ApplicationCore.Interfaces.Repositories;
+using Hangfire;
 using Infrastructure.Data;
 using Infrastructure.Repositories;
-using ApplicationCore.Interfaces.Repositories;
 using Microsoft.EntityFrameworkCore;
-using Hangfire;
 
-var builder = WebApplication.CreateBuilder(args);
+WebApplicationBuilder builder = WebApplication.CreateBuilder(args);
 
 // Add CORS policy
 builder.Services.AddCors(options =>
@@ -12,7 +12,7 @@ builder.Services.AddCors(options =>
     options.AddPolicy("AllowSpecificOrigin",
         policy =>
         {
-            policy.WithOrigins("http://localhost:5173") // Allow frontend URL
+            _ = policy.WithOrigins("http://localhost:5173") // Allow frontend URL
                   .AllowAnyHeader()
                   .AllowAnyMethod();
         });
@@ -42,14 +42,14 @@ builder.Services.AddHangfire(options =>
 
 builder.Services.AddHangfireServer();
 
-var app = builder.Build();
+WebApplication app = builder.Build();
 app.UseHangfireDashboard("/hangfire");
 
 // Use Swagger middleware in the request pipeline
 if (app.Environment.IsDevelopment())
 {
-    app.UseSwagger();
-    app.UseSwaggerUI();
+    _ = app.UseSwagger();
+    _ = app.UseSwaggerUI();
 }
 
 // Enable CORS before routing
@@ -59,4 +59,4 @@ app.UseCors("AllowSpecificOrigin");
 app.UseRouting();
 app.MapControllers();
 
-app.Run();
+await app.RunAsync();
